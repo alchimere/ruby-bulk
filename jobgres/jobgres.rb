@@ -10,44 +10,85 @@
 #   * using DB and running in it's own process like tobi/delayed_job
 #   * taking advantage of postgres mechanisms
 #
-class Jobgres
+module Jobgres
 
-  TABLE_NAME = 'jobgres_queue'.freeze
-
-  def self.table_name
-    return 'delayed_jobs'.freeze # For tests with already existing table
-    return TABLE_NAME
+  class Error < RuntimeError
   end
 
-  def self.default_priority
-    return @default_priority||0
+  # Raised when trying to queue an already queued job
+  class JobExistsError < Error
   end
 
-  def self.queue_name
-    return @queue_name.to_s
-  end
+  module Job
 
-  def self.connection
-    return ActiveRecord::Base.connection
-  end
+    TABLE_NAME = 'jobgres_jobs'.freeze
+    DEFAULT_PRIORITY = 0 # < is low priority and > 0 is high priority
 
-  def self.enqueue *params, job_id: nil, priority: nil
-    job_id ||= "#{Time.now.to_f}-#{Process.pid}"
-    priority ||= default_priority
+    def self.included(base)
+      base.extend(ClassMethods)
 
-    # Double single quotes to escape it (needed by postgres)
-    json_params = params.to_json.gsub!("'", "''")
+      base.class_attribute :job_table_name
+      base.job_table_name = TABLE_NAME
 
-    sql_insert = %{
-      INSERT INTO "#{table_name}"
-               ("id",                        "attempts", "created_at",      "failed_at", "handler",           "last_error", "locked_at", "locked_by", "priority",        "queue",                         "run_at",          "updated_at")
-        VALUES ('#{job_id.gsub("'", "''")}', 0,          current_timestamp, null,        E'#{json_params}',    null,         null,        null,        #{priority.to_i}, '#{queue_name.gsub("'", "''")}', current_timestamp, null)
-    }
+      base.class_attribute :job_priority
+      base.job_priority = DEFAULT_PRIORITY
+    end
 
-    puts sql_insert
-    connection.execute(sql_insert)
+    module ClassMethods
+      def job_table(table_name)
+        self.job_table_name = table_name.to_s
+      end
 
-    return job_id
+      def job_priority(priority)
+        self.job_priority = priority.to_i
+      end
+    end
+
+    def enqueue_job *params, priority: nil, signature: nil
+      # Double single quotes to escape it (needed by postgres)
+      table_name  = job_table_name.to_s
+      priority    = (priority  || job_priority ).to_i
+      signature   = (signature || jobgres_default_signature).gsub("'", "''")
+      job_class   = self.class.name
+      json_params = params.to_json
+      json_params.gsub!("'", "''")
+
+      sql_insert = %{
+        INSERT INTO "#{table_name}"
+                 ( "priority",   "signature",    "job_class",         "params",        "queued_at")
+          VALUES (#{priority}, '#{signature}', '#{job_class}', '#{json_params}', current_timestamp)
+          RETURNING "id";
+      }
+
+      begin
+        job_id = jobgres_connection
+          .execute(sql_insert)
+          .values.first.try(:first)
+      rescue ActiveRecord::RecordNotUnique
+        msg = "Job with signature '#{signature}' is already queued"
+        raise JobExistsError, msg
+      end
+
+      return job_id
+    end
+
+    # #try_enqueue_job is for debug purpose only
+    def try_enqueue_job *params, priority: nil, signature: nil
+      return enqueue_job(*params, priority: priority, signature: signature)
+    rescue => e
+      Rails.logger.warn("[JOBGRES] Cannot enqueue job : #{e.message}")
+      return nil
+    end
+
+
+    def jobgres_default_signature
+      "#{Time.now.to_f}-#{Process.pid}"
+    end
+
+    def jobgres_connection
+      return ActiveRecord::Base.connection
+    end
+
   end
 
 end
